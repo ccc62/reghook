@@ -1,0 +1,40 @@
+name: Build Android ARM64
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+      - name: Build ARM64 binary
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+            -std=c11 -O2 -Wall -Wextra -Wno-unused-parameter \
+            reg_hook.c -o dist/reghook-arm64
+          file dist/reghook-arm64
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -h dist/reghook-arm64
+          cp README_CN.md dist/
+          cp reg_hook.c dist/
+          sha256sum dist/reghook-arm64 > dist/SHA256SUMS.txt
+          cd dist && zip -r ../RegHook-android-arm64.zip .
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RegHook-android-arm64
+          path: RegHook-android-arm64.zip
+          retention-days: 30
