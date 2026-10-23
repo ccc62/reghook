@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.10)
+project(RegHook C)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+add_executable(reghook reg_hook.c)
+target_compile_options(reghook PRIVATE -Wall -Wextra -O2)
