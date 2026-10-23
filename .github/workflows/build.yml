@@ -1,0 +1,42 @@
+name: Build RegHook ARM64
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build-android-arm64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+      - name: Build ARM64 executable
+        shell: bash
+        run: |
+          set -euxo pipefail
+          TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          mkdir -p build
+          "$TOOLCHAIN/aarch64-linux-android24-clang" -std=c11 -O2 -Wall -Wextra reg_hook.c -o build/reghook-arm64
+          file build/reghook-arm64
+          "$TOOLCHAIN/llvm-readelf" -h build/reghook-arm64
+      - name: Package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          cp build/reghook-arm64 README_CN.md reg_hook.c dist/
+          (cd dist && sha256sum reghook-arm64 > SHA256SUMS.txt)
+          zip -r RegHook-android-arm64.zip dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RegHook-android-arm64
+          path: |
+            build/reghook-arm64
+            RegHook-android-arm64.zip
+          if-no-files-found: error
+          retention-days: 30
