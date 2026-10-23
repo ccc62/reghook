@@ -1,0 +1,72 @@
+name: Build RegHook v6 ARM64
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'reg_hook.c'
+      - 'README_CN.md'
+      - 'RegHook-v6/**'
+      - '.github/workflows/build.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+
+      - name: Locate source files
+        id: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f reg_hook.c ]]; then
+            echo "c_file=reg_hook.c" >> "$GITHUB_OUTPUT"
+            echo "readme=README_CN.md" >> "$GITHUB_OUTPUT"
+          elif [[ -f RegHook-v6/reg_hook.c ]]; then
+            echo "c_file=RegHook-v6/reg_hook.c" >> "$GITHUB_OUTPUT"
+            echo "readme=RegHook-v6/README_CN.md" >> "$GITHUB_OUTPUT"
+          else
+            echo "ERROR: reg_hook.c not found at repository root or in RegHook-v6/" >&2
+            echo "Repository files:" >&2
+            find . -maxdepth 3 -type f -print >&2
+            exit 1
+          fi
+
+      - name: Compile ARM64 binary
+        shell: bash
+        env:
+          SOURCE_C: ${{ steps.src.outputs.c_file }}
+        run: |
+          set -euxo pipefail
+          mkdir -p build
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+            -std=c11 -O2 -Wall -Wextra -Wno-misleading-indentation \
+            "$SOURCE_C" -o build/reghook-arm64
+          file build/reghook-arm64
+
+      - name: Package artifacts
+        shell: bash
+        env:
+          SOURCE_C: ${{ steps.src.outputs.c_file }}
+          SOURCE_README: ${{ steps.src.outputs.readme }}
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          cp build/reghook-arm64 dist/
+          cp "$SOURCE_README" dist/README_CN.md
+          cp "$SOURCE_C" dist/reg_hook.c
+          sha256sum dist/reghook-arm64 > dist/SHA256SUMS
+          cd dist && zip -r ../RegHook-v6-ARM64.zip .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RegHook-v6-ARM64
+          path: |
+            build/reghook-arm64
+            dist/RegHook-v6-ARM64.zip
