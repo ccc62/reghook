@@ -1,0 +1,56 @@
+name: Build RegHook v6.4 ARM64
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'reg_hook.c'
+      - 'README_CN.md'
+      - '.github/workflows/build.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+
+      - name: Verify source layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f reg_hook.c
+          test -f README_CN.md
+          echo "Source files found at repository root."
+
+      - name: Compile ARM64 binary
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p build
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+            -std=c11 -O2 -Wall -Wextra -Wno-misleading-indentation \
+            reg_hook.c -o build/reghook-arm64
+          file build/reghook-arm64
+
+      - name: Package artifacts
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          cp build/reghook-arm64 dist/
+          cp README_CN.md dist/
+          cp reg_hook.c dist/
+          sha256sum dist/reghook-arm64 > dist/SHA256SUMS
+          cd dist && zip -r ../RegHook-v6.4-ARM64.zip .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RegHook-v6.4-ARM64
+          path: |
+            build/reghook-arm64
+            dist/RegHook-v6.4-ARM64.zip
