@@ -1,0 +1,769 @@
+#define _GNU_SOURCE
+#include <dirent.h>
+#include <errno.h>
+#include <limits.h>
+#include <signal.h>
+#include <sys/select.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ptrace.h>
+#include <sys/types.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#if !defined(__aarch64__)
+#error "RegHook supports ARM64/AArch64 only."
+#endif
+
+#ifndef __WALL
+#define __WALL 0x40000000
+#endif
+#ifndef NT_PRSTATUS
+#define NT_PRSTATUS 1
+#endif
+#ifndef NT_ARM_HW_BREAK
+#define NT_ARM_HW_BREAK 0x402
+#endif
+#ifndef TRAP_HWBKPT
+#define TRAP_HWBKPT 4
+#endif
+#ifndef TRAP_TRACE
+#define TRAP_TRACE 2
+#endif
+#ifndef PTRACE_EVENT_STOP
+#define PTRACE_EVENT_STOP 128
+#endif
+
+#define MAX_HW_BREAKS 16
+#define MAX_RULES 8
+
+struct arm64_regs {
+    uint64_t regs[31];
+    uint64_t sp;
+    uint64_t pc;
+    uint64_t pstate;
+};
+
+struct hw_break_reg { uint64_t addr; uint32_t ctrl; uint32_t pad; };
+struct hw_break_state { uint32_t dbg_info; uint32_t pad; struct hw_break_reg dbg_regs[MAX_HW_BREAKS]; };
+
+struct hook_rule {
+    uint64_t addr;
+    uint64_t value;
+    int reg_index;
+    int width32; /* 1 = W register semantics, 0 = X register semantics */
+    unsigned long long hits;
+    unsigned long long writes_failed;
+};
+
+struct thread_entry {
+    pid_t tid;
+    int attached;
+    int stopped;
+    int stepping;
+    int stepping_rule;
+    int pending_signal;
+    int rule_slots[MAX_RULES];
+    unsigned int monitoring_mask;
+    int have_hw_state;
+    unsigned int restore_slots;
+    struct hw_break_state original;
+    /* enabled_state is the configured state (all installed rules enabled).
+       current_state tracks the actual per-thread state while one rule is
+       temporarily disabled during single-step. */
+    struct hw_break_state enabled_state;
+    struct hw_break_state current_state;
+    unsigned long long rule_hits[MAX_RULES];
+};
+
+static volatile sig_atomic_t g_running = 1;
+static int g_paused = 0;
+static int g_stdin_enabled = 1;
+static unsigned long long g_hits = 0;              /* 成功写回寄存器 */
+static unsigned long long g_hw_hits = 0;           /* 识别到的硬件断点事件 */
+static unsigned long long g_write_failures = 0;
+static unsigned long long g_step_failures = 0;
+static unsigned long long g_reenable_failures = 0;
+static unsigned long long g_continue_failures = 0;
+static unsigned long long g_restore_failures = 0;
+static unsigned long long g_detach_failures = 0;
+static unsigned long long g_unexpected_stops = 0;
+static unsigned long long g_attach_failures = 0;
+static unsigned long long g_setup_failures = 0;
+static unsigned long long g_reg_read_failures = 0;
+static unsigned long long g_cleanup_stop_failures = 0;
+static unsigned long long g_threads_found = 0;
+static unsigned long long g_threads_attached = 0;
+static unsigned long long g_threads_resumed = 0;
+static int g_verbose = 0;
+static unsigned long long g_last_hit_log_ms = 0;
+static void stop_handler(int sig) { (void)sig; g_running = 0; }
+
+static void clean_input(char *s) {
+    /* Strip common invisible Unicode formatting characters without reading
+       beyond the NUL terminator (the previous byte-lookahead could do that). */
+    size_t n = strlen(s), r = 0, w = 0;
+    while (r < n) {
+        if (r + 2 < n && (unsigned char)s[r] == 0xE2 &&
+            (unsigned char)s[r + 1] == 0x80) {
+            unsigned char c = (unsigned char)s[r + 2];
+            if ((c >= 0x8A && c <= 0x8F) || (c >= 0xAA && c <= 0xAE) || c == 0x8B) {
+                r += 3;
+                continue;
+            }
+        }
+        if (r + 2 < n && (unsigned char)s[r] == 0xEF &&
+            (unsigned char)s[r + 1] == 0xBB && (unsigned char)s[r + 2] == 0xBF) {
+            r += 3;
+            continue;
+        }
+        s[w++] = s[r++];
+    }
+    s[w] = '\0';
+}
+
+static int read_line(const char *prompt, char *buf, size_t size) {
+    for (;;) {
+        fputs(prompt, stdout);
+        fflush(stdout);
+        if (!fgets(buf, (int)size, stdin)) return -1;
+        size_t n = strlen(buf);
+        int has_newline = n > 0 && buf[n - 1] == '\n';
+        if (!has_newline && !feof(stdin)) {
+            int ch;
+            while ((ch = getchar()) != '\n' && ch != EOF) { }
+            puts("输入过长，已丢弃多余字符，请重新输入。\n");
+            continue;
+        }
+        clean_input(buf);
+        buf[strcspn(buf, "\r\n")] = '\0';
+        char *p = buf;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (p != buf) memmove(buf, p, strlen(p) + 1);
+        n = strlen(buf);
+        while (n && (buf[n - 1] == ' ' || buf[n - 1] == '\t')) buf[--n] = '\0';
+        return 0;
+    }
+}
+static int parse_hex_u64(const char *s,uint64_t *out) {
+    if(!s||!*s||!out)return -1; if(s[0]=='0'&&(s[1]=='x'||s[1]=='X'))s+=2; if(!*s)return -1;
+    for(const char*p=s;*p;++p)if(!((*p>='0'&&*p<='9')||(*p>='a'&&*p<='f')||(*p>='A'&&*p<='F')))return -1;
+    errno=0; char *end=NULL; unsigned long long v=strtoull(s,&end,16); if(errno||!end||*end)return -1; *out=(uint64_t)v; return 0;
+}
+static int parse_dec_u64(const char *s,uint64_t *out) {
+    if(!s||!*s||!out)return -1;
+    for(const char*p=s;*p;++p)if(*p<'0'||*p>'9')return -1;
+    errno=0; char *end=NULL; unsigned long long v=strtoull(s,&end,10);
+    if(errno||!end||*end)return -1; *out=(uint64_t)v; return 0;
+}
+static int parse_register(const char *s, int *out, int *width32) {
+    if (!s || !*s || !out || !width32) return -1;
+    *width32 = 0;
+    if (*s == 'x' || *s == 'X') ++s;
+    else if (*s == 'w' || *s == 'W') { *width32 = 1; ++s; }
+    if (!*s) return -1;
+    errno = 0; char *e = NULL; long v = strtol(s, &e, 10);
+    if (errno || !e || *e || v < 0 || v > 30) return -1;
+    *out = (int)v; return 0;
+}
+static int is_numeric(const char*s){if(!s||!*s)return 0;for(;*s;++s)if(*s<'0'||*s>'9')return 0;return 1;}
+
+struct proc_candidate { pid_t pid; char name[256]; int exact; };
+static int resolve_target_input(const char *input, pid_t *out_pid) {
+    if (!input || !*input || !out_pid) return -1;
+    if (is_numeric(input)) {
+        errno = 0; char *end = NULL; long v = strtol(input, &end, 10);
+        if (errno || !end || *end || v <= 0 || v > INT_MAX || kill((pid_t)v, 0) == -1) return -1;
+        *out_pid = (pid_t)v; return 0;
+    }
+    if (strchr(input, '/') || strchr(input, ' ') || strlen(input) >= 200) return -1;
+    DIR *d = opendir("/proc");
+    if (!d) return -1;
+    struct proc_candidate *a = NULL; size_t n = 0, cap = 0; struct dirent *de;
+    while ((de = readdir(d))) {
+        if (!is_numeric(de->d_name)) continue;
+        long v = strtol(de->d_name, NULL, 10);
+        if (v <= 0 || v > INT_MAX) continue;
+        char path[128]; snprintf(path, sizeof(path), "/proc/%ld/cmdline", v);
+        FILE *fp = fopen(path, "rb"); if (!fp) continue;
+        char name[256]; size_t got = fread(name, 1, sizeof(name)-1, fp); fclose(fp);
+        if (!got) continue;
+        name[got] = '\0';
+        int exact = strcmp(name, input) == 0;
+        size_t ilen = strlen(input);
+        int child = strncmp(name, input, ilen) == 0 && name[ilen] == ':';
+        if (!exact && !child) continue;
+        if (cap == n) { size_t nc = cap ? cap * 2 : 8; void *q = realloc(a, nc * sizeof(*a)); if (!q) { free(a); closedir(d); return -1; } a=q; cap=nc; }
+        a[n].pid=(pid_t)v; snprintf(a[n].name,sizeof(a[n].name),"%s",name); a[n].exact=exact; n++;
+    }
+    closedir(d);
+    if (!n) { free(a); return -1; }
+    size_t exact_n=0, exact_i=0;
+    for (size_t i=0;i<n;i++) if(a[i].exact){exact_n++;exact_i=i;}
+    if (exact_n==1) { *out_pid=a[exact_i].pid; printf("[包名识别] %s -> PID %d (%s)\n",input,*out_pid,a[exact_i].name); free(a); return 0; }
+    if (exact_n==0 && n==1) { *out_pid=a[0].pid; printf("[包名识别] %s -> PID %d (%s)\n",input,*out_pid,a[0].name); free(a); return 0; }
+    puts("[包名识别] 找到多个匹配进程，请选择一个 PID：");
+    for (size_t i=0;i<n;i++) printf("  PID %-7d %-40s%s\n",a[i].pid,a[i].name,a[i].exact?" [主进程精确匹配]":" [子进程]");
+    char b[64];
+    for (;;) {
+        if (read_line("输入上面列出的 PID（q 返回）: ",b,sizeof(b))<0) { free(a); return -1; }
+        if (!strcmp(b,"q")||!strcmp(b,"Q")) { free(a); return -1; }
+        if (is_numeric(b)) {
+            long v=strtol(b,NULL,10);
+            for(size_t i=0;i<n;i++) if(a[i].pid==(pid_t)v){*out_pid=(pid_t)v;free(a);return 0;}
+        }
+        puts("请输入列表中的 PID。");
+    }
+}
+
+/* Returns 1 if addr lies in an executable mapping, 0 if maps was readable
+   but no executable mapping matched, and -1 if maps could not be inspected. */
+static int address_is_executable(pid_t pid, uint64_t addr) {
+    char path[128], line[1024];
+    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+    int found = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        unsigned long long lo = 0, hi = 0;
+        char perms[5] = {0};
+        if (sscanf(line, "%llx-%llx %4s", &lo, &hi, perms) == 3 &&
+            addr >= (uint64_t)lo && addr < (uint64_t)hi && perms[2] == 'x') {
+            found = 1;
+            break;
+        }
+    }
+    fclose(fp);
+    return found;
+}
+static int get_regs(pid_t tid,struct arm64_regs*r){struct iovec i={r,sizeof(*r)};return ptrace(PTRACE_GETREGSET,tid,(void*)(uintptr_t)NT_PRSTATUS,&i)==-1?-1:0;}
+static int set_regs(pid_t tid,struct arm64_regs*r){struct iovec i={r,sizeof(*r)};return ptrace(PTRACE_SETREGSET,tid,(void*)(uintptr_t)NT_PRSTATUS,&i)==-1?-1:0;}
+static int get_hw_state(pid_t tid,struct hw_break_state*s){memset(s,0,sizeof(*s));struct iovec i={s,sizeof(*s)};if(ptrace(PTRACE_GETREGSET,tid,(void*)(uintptr_t)NT_ARM_HW_BREAK,&i)==-1)return -1;return 0;}
+static int set_hw_state(pid_t tid,struct hw_break_state*s,unsigned int slots){
+    /* Limit SETREGSET to the slot prefix being changed; don't write all 16. */
+    if(slots==0) return 0;
+    if(slots>MAX_HW_BREAKS) slots=MAX_HW_BREAKS;
+    size_t len=offsetof(struct hw_break_state,dbg_regs)+(size_t)slots*sizeof(struct hw_break_reg);
+    struct iovec i={s,len};
+    return ptrace(PTRACE_SETREGSET,tid,(void*)(uintptr_t)NT_ARM_HW_BREAK,&i)==-1?-1:0;
+ }
+
+static unsigned long long monotonic_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1) return 0;
+    return (unsigned long long)ts.tv_sec * 1000ULL + (unsigned long long)ts.tv_nsec / 1000000ULL;
+}
+
+/* After changing our slots during P/C, read the state back and verify it. */
+static int set_hw_state_verified(pid_t tid, struct hw_break_state *wanted,
+                                 unsigned int slots, const struct thread_entry *t) {
+    if (set_hw_state(tid, wanted, slots) == -1) return -1;
+    struct hw_break_state actual;
+    if (get_hw_state(tid, &actual) == -1) return -1;
+    for (int r = 0; r < MAX_RULES; r++) {
+        int slot = t->rule_slots[r];
+        if (slot < 0 || (unsigned int)slot >= slots) continue;
+        if (actual.dbg_regs[slot].ctrl != wanted->dbg_regs[slot].ctrl ||
+            actual.dbg_regs[slot].addr != wanted->dbg_regs[slot].addr) {
+            errno = EIO;
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void log_hit_summary(int rule_index, pid_t tid, uint64_t pc,
+                            const struct hook_rule *rule) {
+    unsigned long long now = monotonic_ms();
+    /* Always show the first hit, then at most one summary per second. Counters
+       continue updating for every event; R and the final report show totals. */
+    if (g_last_hit_log_ms != 0 && now != 0 && now - g_last_hit_log_ms < 1000ULL) return;
+    g_last_hit_log_ms = now ? now : 1;
+    printf("\n[命中摘要] 规则=#%d，累计事件=%llu，写回成功=%llu，最近 TID=%d，PC=0x%llx，%c%d=0x%llx\n",
+           rule_index + 1, g_hw_hits, g_hits, tid, (unsigned long long)pc,
+           rule->width32 ? 'W' : 'X', rule->reg_index, (unsigned long long)rule->value);
+    fflush(stdout);
+}
+
+
+static void cleanup(struct thread_entry *a, size_t n);
+
+static int attach_threads(pid_t pid,struct thread_entry **out,size_t *count){
+    char path[128];snprintf(path,sizeof(path),"/proc/%d/task",pid);DIR*d=opendir(path);if(!d){fprintf(stderr,"[错误] 无法读取线程列表：%s\n",strerror(errno));return -1;}
+    struct thread_entry*items=NULL;size_t n=0,cap=0;struct dirent*e;
+    while((e=readdir(d))){if(!is_numeric(e->d_name))continue;pid_t tid=(pid_t)strtol(e->d_name,NULL,10); g_threads_found++;
+        if(cap==n){size_t nc=cap?cap*2:16;void*p=realloc(items,nc*sizeof(*items));if(!p){closedir(d);cleanup(items,n);return -1;}items=p;cap=nc;}
+        if(ptrace(PTRACE_SEIZE,tid,NULL,NULL)==-1){g_attach_failures++;if(g_verbose)fprintf(stderr,"[提示] TID %d 附加失败：%s\n",tid,strerror(errno));continue;}
+        if(ptrace(PTRACE_INTERRUPT,tid,NULL,NULL)==-1){
+            int saved=errno; g_attach_failures++;
+            if(g_verbose)fprintf(stderr,"[提示] TID %d 中断失败：%s\n",tid,strerror(saved));
+            if(ptrace(PTRACE_DETACH,tid,NULL,NULL)==-1 && errno!=ESRCH){
+                /* Keep an entry so final cleanup can retry interrupt/detach. */
+                memset(&items[n],0,sizeof(items[n])); items[n].tid=tid;
+                items[n].attached=1; items[n].stopped=0; items[n].stepping_rule=-1;
+                for (int k=0;k<MAX_RULES;k++) items[n].rule_slots[k]=-1; n++;
+            }
+            continue;
+        }
+        int st=0;pid_t wr;do{wr=waitpid(tid,&st,__WALL);}while(wr==-1&&errno==EINTR);
+        if(wr!=tid||!WIFSTOPPED(st)){
+            g_attach_failures++;
+            if(g_verbose)fprintf(stderr,"[提示] TID %d 未进入停止状态。\n",tid);
+            if(ptrace(PTRACE_DETACH,tid,NULL,NULL)==-1 && errno!=ESRCH){
+                memset(&items[n],0,sizeof(items[n])); items[n].tid=tid;
+                items[n].attached=1; items[n].stopped=0; items[n].stepping_rule=-1;
+                for (int k=0;k<MAX_RULES;k++) items[n].rule_slots[k]=-1; n++;
+            }
+            continue;
+        }
+        memset(&items[n],0,sizeof(items[n]));items[n].tid=tid;items[n].attached=1;items[n].stopped=1;items[n].stepping_rule=-1;for(int k=0;k<MAX_RULES;k++)items[n].rule_slots[k]=-1;n++;
+    }
+    closedir(d);*out=items;*count=n;g_threads_attached=n;return n?0:-1;
+}
+static int setup_hw_breaks(struct thread_entry *t, const struct hook_rule *rules, int rule_count) {
+    struct hw_break_state state;
+    if (get_hw_state(t->tid, &state) == -1) {
+        if (g_verbose) fprintf(stderr, "[提示] TID %d 读取硬件断点状态失败：%s\n", t->tid, strerror(errno));
+        return 0;
+    }
+    unsigned int slots = state.dbg_info & 0xffu;
+    if (slots > MAX_HW_BREAKS) slots = MAX_HW_BREAKS;
+    if (!slots) {
+        if (g_verbose) fprintf(stderr, "[提示] TID %d 内核报告没有硬件执行断点槽位。\n", t->tid);
+        return 0;
+    }
+    t->original = state;
+    t->enabled_state = state;
+    t->current_state = state;
+    t->have_hw_state = 1;
+    int installed = 0;
+    for (int ri = 0; ri < rule_count; ri++) {
+        int slot = -1;
+        for (unsigned int j = 0; j < slots; j++) {
+            if (!(t->enabled_state.dbg_regs[j].ctrl & 1u)) {
+                int used = 0;
+                for (int k = 0; k < ri; k++) if (t->rule_slots[k] == (int)j) { used = 1; break; }
+                if (!used) { slot = (int)j; break; }
+            }
+        }
+        if (slot < 0) {
+            if (g_verbose) fprintf(stderr, "[提示] TID %d 没有足够空闲槽位安装规则 #%d。\n", t->tid, ri + 1);
+            continue;
+        }
+        t->enabled_state.dbg_regs[slot].addr = rules[ri].addr;
+        t->enabled_state.dbg_regs[slot].ctrl = 1u | (2u << 1) | (0xFu << 5);
+        t->enabled_state.dbg_regs[slot].pad = 0;
+        if (set_hw_state(t->tid, &t->enabled_state, (unsigned int)slot + 1) == -1) {
+            int saved = errno;
+            t->enabled_state.dbg_regs[slot] = state.dbg_regs[slot];
+            if (g_verbose) fprintf(stderr, "[提示] TID %d 安装规则 #%d 失败：%s\n", t->tid, ri + 1, strerror(saved));
+            continue;
+        }
+        t->rule_slots[ri] = slot;
+        t->current_state = t->enabled_state;
+        t->monitoring_mask |= (1u << ri);
+        if ((unsigned int)(slot + 1) > t->restore_slots) t->restore_slots = (unsigned int)slot + 1;
+        installed++;
+    }
+    t->current_state = t->enabled_state;
+    if (!t->restore_slots) t->have_hw_state = 0;
+    if (g_verbose) printf("[诊断] TID %d: 硬件槽位=%u，安装规则=%d/%d\n", t->tid, slots, installed, rule_count);
+    return installed;
+}
+static int set_thread_rule_enabled(struct thread_entry *t, int rule_index, int enabled) {
+    if (!t->have_hw_state || rule_index < 0 || rule_index >= MAX_RULES || t->rule_slots[rule_index] < 0) return -1;
+    int slot = t->rule_slots[rule_index];
+    /* Start from the last successfully applied state, not the configured
+       all-enabled template. Otherwise re-enabling rule B can accidentally
+       re-enable rule A while A is still single-stepping. */
+    struct hw_break_state state = t->current_state;
+    state.dbg_regs[slot].ctrl = enabled ? t->enabled_state.dbg_regs[slot].ctrl : 0;
+    if (set_hw_state(t->tid, &state, (unsigned int)slot + 1) == -1) return -1;
+    t->current_state = state;
+    return 0;
+}
+static int find_rule_by_pc(const struct hook_rule *rules, int count, uint64_t pc) {
+    for (int i = 0; i < count; i++) if (rules[i].addr == pc) return i;
+    return -1;
+}
+static struct thread_entry*find_thread(struct thread_entry*a,size_t n,pid_t tid){for(size_t i=0;i<n;i++)if(a[i].tid==tid)return &a[i];return NULL;}
+static void cleanup(struct thread_entry *a, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (!a[i].attached) continue;
+        if (!a[i].stopped) {
+            if (ptrace(PTRACE_INTERRUPT, a[i].tid, NULL, NULL) == 0) {
+                int st = 0;
+                pid_t w;
+                do { w = waitpid(a[i].tid, &st, __WALL); }
+                while (w == -1 && errno == EINTR);
+                if (w == a[i].tid && WIFSTOPPED(st)) a[i].stopped = 1;
+                else if (w == -1 && errno == ECHILD) {
+                    a[i].attached = 0;
+                    continue;
+                }
+            } else if (errno == ESRCH || errno == ECHILD) {
+                a[i].attached = 0;
+                continue;
+            }
+        }
+        if (!a[i].stopped) {
+            /* PTRACE_DETACH requires a ptrace-stop. Do not pretend that a
+               detach succeeded or discard this failure from the summary. */
+            g_cleanup_stop_failures++;
+            fprintf(stderr, "[严重警告] TID %d 未能确认停止，跳过硬件状态恢复；尝试最后一次分离。\n", a[i].tid);
+            if (ptrace(PTRACE_DETACH, a[i].tid, NULL, NULL) == -1 && errno != ESRCH) {
+                g_detach_failures++;
+                fprintf(stderr, "[严重警告] TID %d 最后尝试分离也失败：errno=%d (%s)\n", a[i].tid, errno, strerror(errno));
+            }
+            continue;
+        }
+        if (a[i].have_hw_state && a[i].restore_slots > 0 &&
+            set_hw_state(a[i].tid, &a[i].original, a[i].restore_slots) == -1) {
+            g_restore_failures++;
+            fprintf(stderr, "[警告] TID %d 恢复原硬件断点状态失败：errno=%d (%s)\n",
+                    a[i].tid, errno, strerror(errno));
+        }
+        if (ptrace(PTRACE_DETACH, a[i].tid, NULL, NULL) == -1 && errno != ESRCH) {
+            g_detach_failures++;
+            fprintf(stderr, "[错误] TID %d 分离失败：errno=%d (%s)\n", a[i].tid, errno, strerror(errno));
+        }
+    }
+    free(a);
+}
+
+static void set_owned_slots(struct thread_entry *t, int enable) {
+    if (!t->have_hw_state) return;
+    struct hw_break_state state = t->current_state;
+    for (int r=0;r<MAX_RULES;r++) {
+        int slot=t->rule_slots[r];
+        if (slot<0) continue;
+        int active = enable && (t->monitoring_mask & (1u<<r));
+        state.dbg_regs[slot].ctrl = active ? t->enabled_state.dbg_regs[slot].ctrl : 0;
+    }
+    if (set_hw_state(t->tid,&state,t->restore_slots)==-1) {
+        fprintf(stderr,"[错误] TID %d 更新暂停/继续状态失败：%s\n",t->tid,strerror(errno));
+        return;
+    }
+    t->current_state=state;
+}
+
+/* Stop all tracked threads briefly, change only our owned breakpoint slots,
+   then resume them. The target process is not intentionally left stopped. */
+static int toggle_monitoring(struct thread_entry *a, size_t n, int enable) {
+    int *requested = calloc(n ? n : 1, sizeof(*requested));
+    if (!requested) { fprintf(stderr,"[错误] 无法分配暂停状态表。\n"); return -1; }
+    size_t stopped=0; int failed=0;
+    for(size_t i=0;i<n;i++) {
+        if(!a[i].attached || a[i].stopped) continue;
+        if(ptrace(PTRACE_INTERRUPT,a[i].tid,NULL,NULL)==0) requested[i]=1;
+        else if(errno==ESRCH || errno==ECHILD) { a[i].attached=0; a[i].stopped=0; }
+        else {
+            /* EIO can mean the tracee is already in a ptrace-stop even if our
+               bookkeeping has not observed it yet. Probe without blocking. */
+            int st=0; pid_t w=waitpid(a[i].tid,&st,__WALL|WNOHANG);
+            if(w==a[i].tid && WIFSTOPPED(st)) {
+                a[i].stopped=1; stopped++;
+                unsigned int event=(unsigned int)st>>16; int sig=WSTOPSIG(st);
+                siginfo_t si; memset(&si,0,sizeof(si)); int have_si=ptrace(PTRACE_GETSIGINFO,a[i].tid,NULL,&si)==0;
+                if(event!=PTRACE_EVENT_STOP && !(a[i].stepping && sig==SIGTRAP && have_si && si.si_code==TRAP_TRACE) &&
+                   !(sig==SIGTRAP && have_si && si.si_code==TRAP_HWBKPT)) a[i].pending_signal=sig;
+                if(a[i].stepping) { a[i].stepping=0; a[i].stepping_rule=-1; }
+            } else { fprintf(stderr,"[警告] TID %d 请求暂时停止失败：%s\n",a[i].tid,strerror(errno)); failed=1; }
+        }
+    }
+    for(size_t i=0;i<n;i++) {
+        if(!requested[i] || !a[i].attached || a[i].stopped) continue;
+        int st=0; pid_t w;
+        do { w=waitpid(a[i].tid,&st,__WALL); } while(w==-1 && errno==EINTR);
+        if(w==a[i].tid && WIFSTOPPED(st)) {
+            a[i].stopped=1; stopped++;
+            unsigned int event=(unsigned int)st>>16; int sig=WSTOPSIG(st);
+            siginfo_t si; memset(&si,0,sizeof(si)); int have_si=ptrace(PTRACE_GETSIGINFO,a[i].tid,NULL,&si)==0;
+            if(event!=PTRACE_EVENT_STOP && !(a[i].stepping && sig==SIGTRAP && have_si && si.si_code==TRAP_TRACE) &&
+               !(sig==SIGTRAP && have_si && si.si_code==TRAP_HWBKPT)) a[i].pending_signal=sig;
+            /* The pause transition may interrupt a single-step. Treat its
+               instruction as pending work: if PC is unchanged, the breakpoint
+               will be hit again after resume; if advanced, it will re-arm for
+               the next visit. */
+            if(a[i].stepping) { a[i].stepping=0; a[i].stepping_rule=-1; }
+        } else if(w==-1 && (errno==ESRCH || errno==ECHILD)) { a[i].attached=0; a[i].stopped=0; }
+        else { fprintf(stderr,"[警告] TID %d 无法确认进入停止状态。\n",a[i].tid); failed=1; }
+    }
+    free(requested);
+    if (failed) {
+        /* Best-effort restore of normal monitoring state if transition failed. */
+        for(size_t i=0;i<n;i++) if(a[i].attached && a[i].stopped && a[i].have_hw_state) set_owned_slots(&a[i], enable ? 0 : 1);
+        for(size_t i=0;i<n;i++) if(a[i].attached && a[i].stopped) {
+            int sig=a[i].pending_signal; a[i].pending_signal=0;
+            if(ptrace(PTRACE_CONT,a[i].tid,NULL,(void*)(intptr_t)sig)==0) a[i].stopped=0;
+        }
+        return -1;
+    }
+    for(size_t i=0;i<n;i++) if(a[i].attached && a[i].stopped && a[i].have_hw_state) {
+        /* On pause, disable our slots. On resume, enable only rules still
+           marked active for that thread. */
+        if (!enable) {
+            struct hw_break_state state=a[i].current_state;
+            for(int r=0;r<MAX_RULES;r++) if(a[i].rule_slots[r]>=0) state.dbg_regs[a[i].rule_slots[r]].ctrl=0;
+            if(set_hw_state_verified(a[i].tid,&state,a[i].restore_slots,&a[i])==-1) { fprintf(stderr,"[错误] TID %d 禁用断点或回读验证失败：%s\n",a[i].tid,strerror(errno)); failed=1; }
+            else a[i].current_state=state;
+        } else {
+            struct hw_break_state state=a[i].current_state;
+            for(int r=0;r<MAX_RULES;r++) if(a[i].rule_slots[r]>=0)
+                state.dbg_regs[a[i].rule_slots[r]].ctrl=(a[i].monitoring_mask&(1u<<r))?a[i].enabled_state.dbg_regs[a[i].rule_slots[r]].ctrl:0;
+            if(set_hw_state_verified(a[i].tid,&state,a[i].restore_slots,&a[i])==-1) { fprintf(stderr,"[错误] TID %d 恢复断点或回读验证失败：%s\n",a[i].tid,strerror(errno)); failed=1; }
+            else a[i].current_state=state;
+        }
+    }
+    if(failed) {
+        /* Roll back toward the prior logical state: if pausing failed, restore
+           monitoring; if resuming failed, keep our breakpoints disabled. */
+        int fallback_enable = enable ? 0 : 1;
+        for(size_t i=0;i<n;i++) if(a[i].attached && a[i].stopped && a[i].have_hw_state) {
+            struct hw_break_state state=a[i].current_state;
+            for(int r=0;r<MAX_RULES;r++) if(a[i].rule_slots[r]>=0)
+                state.dbg_regs[a[i].rule_slots[r]].ctrl=(fallback_enable && (a[i].monitoring_mask&(1u<<r))) ? a[i].enabled_state.dbg_regs[a[i].rule_slots[r]].ctrl : 0;
+            if(set_hw_state(a[i].tid,&state,a[i].restore_slots)==0) a[i].current_state=state;
+        }
+        g_paused = !fallback_enable;
+        fprintf(stderr,"[警告] 暂停/继续状态切换未能完整完成；已尽力回滚到%s状态。\n",g_paused?"暂停":"监控");
+    } else g_paused = !enable;
+    for(size_t i=0;i<n;i++) if(a[i].attached && a[i].stopped) {
+        int sig=a[i].pending_signal; a[i].pending_signal=0;
+        if(ptrace(PTRACE_CONT,a[i].tid,NULL,(void*)(intptr_t)sig)==0) a[i].stopped=0;
+        else if(errno==ESRCH) { a[i].attached=0; a[i].stopped=0; }
+        else { g_continue_failures++; fprintf(stderr,"[严重警告] TID %d 在暂停/继续切换后恢复运行失败：%s\n",a[i].tid,strerror(errno)); failed=1; }
+    }
+    if(failed) return -1;
+    return (int)stopped;
+}
+
+static int poll_command(char *out, size_t size) {
+    if(!g_stdin_enabled) return 0;
+    fd_set rfds; FD_ZERO(&rfds); FD_SET(STDIN_FILENO,&rfds);
+    struct timeval tv={0,0}; int r=select(STDIN_FILENO+1,&rfds,NULL,NULL,&tv);
+    if(r<0) { if(errno==EINTR)return 0; g_stdin_enabled=0; return 0; }
+    if(r==0 || !FD_ISSET(STDIN_FILENO,&rfds)) return 0;
+    if(!fgets(out,(int)size,stdin)) { g_stdin_enabled=0; return 0; }
+    clean_input(out); out[strcspn(out,"\r\n")]='\0';
+    for(size_t i=strlen(out);i>0 && (out[i-1]==' '||out[i-1]=='\t');i--) out[i-1]='\0';
+    size_t j=0; while(out[j]==' '||out[j]=='\t')j++; if(j)memmove(out,out+j,strlen(out+j)+1);
+    return 1;
+}
+
+int main(void) {
+    char b[256]; long pid_l = 0;
+    struct hook_rule rules[MAX_RULES]; memset(rules, 0, sizeof(rules));
+    int rule_count = 0;
+    puts("========== RegHook v6.4.1 多规则版 (ARM64 ptrace HW breakpoint) ==========");
+    puts("提示：实验版本；会暂停并跟踪目标线程。仅在自有测试进程中验证。");
+    puts("支持 PID/包名；每条规则独立配置地址、X/W 寄存器和写入值。输入 q 可返回上一步。");
+
+retry_pid:
+    memset(rules, 0, sizeof(rules));
+    for (;;) {
+        if (read_line("目标 PID 或包名（例如 com.example.app）: ", b, sizeof(b)) < 0) return 2;
+        if (!strcmp(b,"q") || !strcmp(b,"Q")) return 0;
+        pid_t resolved=0;
+        if (resolve_target_input(b,&resolved)==-1) {
+            puts("PID 无效、包名未找到或进程不可访问，请重新输入。\n"); continue;
+        }
+        pid_l=resolved; break;
+    }
+retry_rule_count:
+    for (;;) {
+        if (read_line("规则数量（1-8）: ", b, sizeof(b)) < 0) return 2;
+        if (!strcmp(b,"q") || !strcmp(b,"Q")) goto retry_pid;
+        errno=0; char *e=NULL; long n=strtol(b,&e,10);
+        if (!*b || errno || !e || *e || n<1 || n>MAX_RULES) {
+            puts("请输入 1 到 8 之间的整数。\n"); continue;
+        }
+        rule_count=(int)n; break;
+    }
+    for (int i=0; i<rule_count; i++) {
+        char prompt[96];
+        printf("\n========== 配置规则 #%d/%d ==========\n", i+1, rule_count);
+retry_rule_addr:
+        for (;;) {
+            snprintf(prompt,sizeof(prompt),"规则 #%d 断点地址（十六进制）: ",i+1);
+            if (read_line(prompt,b,sizeof(b))<0) return 2;
+            if (!strcmp(b,"q")||!strcmp(b,"Q")) { if(i==0) goto retry_rule_count; i--; goto retry_rule_value; }
+            if (parse_hex_u64(b,&rules[i].addr)||!rules[i].addr||(rules[i].addr&3)) {
+                puts("地址无效；须为非零且 4 字节对齐的代码地址。\n"); continue;
+            }
+            int executable=address_is_executable((pid_t)pid_l,rules[i].addr);
+            if (executable==0) { puts("警告：地址不在目标进程可执行映射中，请检查地址。\n"); continue; }
+            if (executable<0) puts("[提示] 无法读取目标进程 maps，跳过可执行映射校验。\n");
+            int duplicate=0; for(int k=0;k<i;k++) if(rules[k].addr==rules[i].addr) duplicate=1;
+            if(duplicate) { puts("该地址已用于前面的规则；每条规则请使用不同地址。\n"); continue; }
+            break;
+        }
+retry_rule_reg:
+        for (;;) {
+            snprintf(prompt,sizeof(prompt),"规则 #%d 目标寄存器（X0-X30/W0-W30）: ",i+1);
+            if(read_line(prompt,b,sizeof(b))<0)return 2;
+            if(!strcmp(b,"q")||!strcmp(b,"Q"))goto retry_rule_addr;
+            if(parse_register(b,&rules[i].reg_index,&rules[i].width32)) { puts("寄存器无效；例如 X8、W11 或 8。\n"); continue; }
+            break;
+        }
+retry_rule_value:
+        {
+            int value_base = 16;
+            for (;;) {
+                snprintf(prompt,sizeof(prompt),"规则 #%d 数值进制（1=十六进制，2=十进制，默认 1）: ",i+1);
+                if(read_line(prompt,b,sizeof(b))<0)return 2;
+                if(!strcmp(b,"q")||!strcmp(b,"Q"))goto retry_rule_reg;
+                if(!*b || !strcmp(b,"1")) { value_base=16; break; }
+                if(!strcmp(b,"2")) { value_base=10; break; }
+                puts("请输入 1 或 2；直接回车使用十六进制。\n");
+            }
+            for (;;) {
+                snprintf(prompt,sizeof(prompt), value_base==16 ? "规则 #%d 写入值（十六进制，可带 0x）: " : "规则 #%d 写入值（十进制）: ",i+1);
+                if(read_line(prompt,b,sizeof(b))<0)return 2;
+                if(!strcmp(b,"q")||!strcmp(b,"Q"))goto retry_rule_reg;
+                int bad = value_base==16 ? parse_hex_u64(b,&rules[i].value) : parse_dec_u64(b,&rules[i].value);
+                if(bad) {
+                    puts(value_base==16 ? "数值无效；请输入十六进制数值，例如 1388 或 0x1388。\n" : "数值无效；请输入不带符号的十进制整数，例如 5000。\n");
+                    continue;
+                }
+                if(rules[i].width32) rules[i].value=(uint32_t)rules[i].value;
+                break;
+            }
+        }
+    }
+    if (read_line("显示逐线程详细诊断？默认 N（输入 y 开启）: ",b,sizeof(b))<0)return 2;
+    g_verbose=(b[0]=='y'||b[0]=='Y'||b[0]=='1');
+    printf("\n[配置确认] PID=%ld，规则数=%d\n",pid_l,rule_count);
+    for(int i=0;i<rule_count;i++) printf("  #%d 地址=0x%llx，寄存器=%c%d，写入值=0x%llx\n",i+1,
+        (unsigned long long)rules[i].addr,rules[i].width32?'W':'X',rules[i].reg_index,(unsigned long long)rules[i].value);
+    puts("注意：每个线程可用的硬件执行断点槽位有限；槽位不足时会跳过部分规则。3 秒后附加线程；按 Ctrl+C 停止。\n");
+    fflush(stdout); sleep(3);
+    signal(SIGINT,stop_handler); signal(SIGTERM,stop_handler);
+    struct thread_entry *ts=NULL; size_t n=0;
+    if(attach_threads((pid_t)pid_l,&ts,&n)) {
+        fprintf(stderr,"[失败] 没有成功附加线程（附加/停止失败次数：%llu）。\n",g_attach_failures); free(ts); return 1;
+    }
+    unsigned long long per_rule_installed[MAX_RULES]={0};
+    size_t threads_with_any_rule=0;
+    for(size_t i=0;i<n;i++) {
+        if(!ts[i].attached||!ts[i].stopped) { g_setup_failures++; continue; }
+        int got=setup_hw_breaks(&ts[i],rules,rule_count);
+        if(got>0) threads_with_any_rule++;
+        for(int r=0;r<rule_count;r++) if(ts[i].rule_slots[r]>=0) per_rule_installed[r]++;
+        if(got==0) g_setup_failures++;
+    }
+    int any_rule=0; for(int r=0;r<rule_count;r++) if(per_rule_installed[r]) any_rule=1;
+    if(!any_rule) {
+        fprintf(stderr,"[失败] 没有线程能安装任何规则；正在恢复并分离。\n"); cleanup(ts,n); return 1;
+    }
+    size_t resumed=0; int startup_resume_failed=0;
+    for(size_t i=0;i<n;i++) {
+        if(!ts[i].attached||!ts[i].stopped) continue;
+        if(ptrace(PTRACE_CONT,ts[i].tid,NULL,NULL)==0) { ts[i].stopped=0; resumed++; }
+        else if(errno==ESRCH) { ts[i].attached=0; ts[i].stopped=0; }
+        else { g_continue_failures++; startup_resume_failed=1; fprintf(stderr,"[严重警告] TID %d 恢复运行失败：%s；将停止监控并清理。\n",ts[i].tid,strerror(errno)); }
+    }
+    g_threads_resumed=resumed;
+    printf("[线程统计] 发现=%llu，附加/记录=%llu，有规则线程=%zu，成功恢复运行=%zu。\n",g_threads_found,g_threads_attached,threads_with_any_rule,resumed);
+    for(int r=0;r<rule_count;r++) printf("[规则统计] #%d 地址=0x%llx，安装到线程数=%llu\n",r+1,(unsigned long long)rules[r].addr,per_rule_installed[r]);
+    puts("监控中。P=暂停断点（目标继续运行），C=继续监控，R=刷新统计，Q=停止清理；命令输入后按 Enter。不会自动跟踪之后新建的线程。\n");
+    fputs("命令 [P/C/R/Q] > ",stdout); fflush(stdout);
+    if(startup_resume_failed)g_running=0;
+    while(g_running) {
+        char cmd[128];
+        if(poll_command(cmd,sizeof(cmd))) {
+            if(!strcmp(cmd,"p")||!strcmp(cmd,"P")) {
+                if(g_paused) puts("\n[状态] 当前已经暂停。");
+                else { puts("\n[操作] 正在暂时禁用硬件执行断点……"); fflush(stdout); int rc=toggle_monitoring(ts,n,0); if(rc>=0) puts("[状态] 已暂停断点监控；目标进程继续运行。按 C 再次启用。\n"); else puts("[警告] 暂停切换遇到问题，请检查上面的诊断信息。\n"); }
+            } else if(!strcmp(cmd,"c")||!strcmp(cmd,"C")) {
+                if(!g_paused) puts("\n[状态] 当前并未暂停。\n");
+                else { puts("\n[操作] 正在恢复硬件执行断点……"); fflush(stdout); int rc=toggle_monitoring(ts,n,1); if(rc>=0) puts("[状态] 监控已继续。\n"); else puts("[警告] 继续切换遇到问题，请检查上面的诊断信息。\n"); }
+            } else if(!strcmp(cmd,"r")||!strcmp(cmd,"R")) {
+                printf("\n[实时统计] 断点事件=%llu，写回成功=%llu，写回失败=%llu，单步失败=%llu，断点启用/恢复失败=%llu，异常停止=%llu，状态=%s\n",
+                       g_hw_hits,g_hits,g_write_failures,g_step_failures,g_reenable_failures,g_unexpected_stops,g_paused?"已暂停":"监控中");
+                for(int ri=0;ri<rule_count;ri++) printf("  #%d 命中=%llu，写回失败=%llu，地址=0x%llx，寄存器=%c%d，目标值=0x%llx\n",ri+1,rules[ri].hits,rules[ri].writes_failed,(unsigned long long)rules[ri].addr,rules[ri].width32?'W':'X',rules[ri].reg_index,(unsigned long long)rules[ri].value);
+                puts(""); fflush(stdout);
+            } else if(!strcmp(cmd,"q")||!strcmp(cmd,"Q")) {
+                puts("\n[操作] 收到停止命令，正在清理……"); g_running=0; break;
+            } else if(*cmd) puts("\n[提示] 未知命令。请输入 P、C、R 或 Q。\n");
+            if(g_running) { fputs("命令 [P/C/R/Q] > ",stdout); fflush(stdout); }
+            continue;
+        }
+        int st=0; pid_t tid=waitpid(-1,&st,__WALL|WNOHANG);
+        if(tid==0){usleep(10000);continue;}
+        if(tid<0){if(errno==EINTR)continue;if(errno==ECHILD){fputs("\n[提示] 当前没有可等待的跟踪线程；目标可能已退出，或跟踪关系已丢失。\n",stderr);break;}fprintf(stderr,"\n[错误] waitpid 失败：%s；停止监控并清理。\n",strerror(errno));g_running=0;break;}
+        struct thread_entry *t=find_thread(ts,n,tid);
+        if(WIFEXITED(st)||WIFSIGNALED(st)){if(t){t->attached=0;t->stopped=0;}continue;}
+        if(!WIFSTOPPED(st))continue;
+        if(t)t->stopped=1;
+        int sig=WSTOPSIG(st),deliver=sig; siginfo_t si; memset(&si,0,sizeof(si)); int have_si=(ptrace(PTRACE_GETSIGINFO,tid,NULL,&si)==0);
+        if(t&&t->stepping&&sig==SIGTRAP&&have_si&&si.si_code==TRAP_TRACE) {
+            int sr=t->stepping_rule;
+            if(sr>=0&&set_thread_rule_enabled(t,sr,1)==-1) {
+                g_reenable_failures++; t->monitoring_mask &= ~(1u<<sr);
+                fprintf(stderr,"\n[警告] TID %d 单步后重新启用规则 #%d 失败；该规则在此线程停止监控：%s\n",tid,sr+1,strerror(errno));
+            }
+            t->stepping=0; t->stepping_rule=-1; deliver=0;
+        } else {
+            if(t&&t->stepping) {
+                struct arm64_regs step_regs; int have_step_regs=get_regs(tid,&step_regs)==0; int sr=t->stepping_rule;
+                if(!have_step_regs) { g_reg_read_failures++; if(sr>=0)t->monitoring_mask &= ~(1u<<sr); fprintf(stderr,"\n[警告] TID %d 单步中断且无法读取 PC；对应规则停止监控。\n",tid); }
+                else if(sr>=0&&step_regs.pc==rules[sr].addr) {
+                    /* The step did not demonstrably advance. Keep the slot disabled
+                       and stop this rule on this TID to avoid a hot re-trap loop. */
+                    t->monitoring_mask &= ~(1u<<sr);
+                    fprintf(stderr,"\n[提示] TID %d 单步未确认离开规则 #%d 地址 (stop-signal=%d, si_code=%d, PC=0x%llx)；该线程上的规则已停用。\n",
+                            tid,sr+1,sig,have_si?si.si_code:0,(unsigned long long)step_regs.pc);
+                }
+                else if(sr>=0&&set_thread_rule_enabled(t,sr,1)==-1) { g_reenable_failures++; t->monitoring_mask &= ~(1u<<sr); fprintf(stderr,"\n[警告] TID %d 单步中断后重新启用规则 #%d 失败；该规则停止监控。\n",tid,sr+1); }
+                t->stepping=0; t->stepping_rule=-1;
+            }
+            if(t&&sig==SIGTRAP&&have_si&&si.si_code==TRAP_HWBKPT) {
+                struct arm64_regs r;
+                if(get_regs(tid,&r)==-1) { g_reg_read_failures++; g_unexpected_stops++; fprintf(stderr,"\n[严重警告] TID %d 硬件断点后无法读取寄存器；停止监控并清理。\n",tid); g_running=0; continue; }
+                int ri=find_rule_by_pc(rules,rule_count,r.pc);
+                if(ri<0||!(t->monitoring_mask&(1u<<ri))) {
+                    g_unexpected_stops++; fprintf(stderr,"\n[提示] TID %d 硬件断点 PC=0x%llx 不匹配已启用规则；转发 SIGTRAP。\n",tid,(unsigned long long)r.pc); deliver=sig;
+                } else {
+                    g_hw_hits++; rules[ri].hits++; t->rule_hits[ri]++;
+                    r.regs[rules[ri].reg_index]=rules[ri].width32?(uint64_t)(uint32_t)rules[ri].value:rules[ri].value;
+                    if(set_regs(tid,&r)==0) {
+                        g_hits++;
+                        log_hit_summary(ri,tid,r.pc,&rules[ri]);
+                    } else { g_write_failures++; rules[ri].writes_failed++; fprintf(stderr,"\n[错误] TID %d 规则 #%d 寄存器写回失败：%s\n",tid,ri+1,strerror(errno)); }
+                    if(set_thread_rule_enabled(t,ri,0)==-1) {
+                        g_reenable_failures++; t->monitoring_mask &= ~(1u<<ri); g_running=0;
+                        fprintf(stderr,"\n[严重警告] TID %d 关闭规则 #%d 断点失败；立即清理。\n",tid,ri+1); continue;
+                    }
+                    t->stepping=1; t->stepping_rule=ri;
+                    if(ptrace(PTRACE_SINGLESTEP,tid,NULL,NULL)==0) { t->stopped=0; continue; }
+                    g_step_failures++; t->stepping=0; t->stepping_rule=-1; t->monitoring_mask &= ~(1u<<ri);
+                    fprintf(stderr,"\n[错误] TID %d 规则 #%d 单步失败：%s；停止监控并清理。\n",tid,ri+1,strerror(errno)); g_running=0; continue;
+                }
+            }
+        }
+        if(ptrace(PTRACE_CONT,tid,NULL,(void*)(intptr_t)deliver)==-1) {
+            if(errno==ESRCH) { if(t){t->attached=0;t->stopped=0;} }
+            else { g_continue_failures++; fprintf(stderr,"\n[严重警告] TID %d 继续执行失败：%s；停止监控并清理。\n",tid,strerror(errno)); g_running=0; break; }
+        } else if(t) t->stopped=0;
+    }
+    puts("\n各线程命中分布（仅列出发生过命中的线程）：");
+    for(size_t i=0;i<n;i++) {
+        int any=0;
+        for(int r=0;r<rule_count;r++) if(ts[i].rule_hits[r]) any=1;
+        if(!any) continue;
+        printf("  TID %d:",ts[i].tid);
+        for(int r=0;r<rule_count;r++) if(ts[i].rule_hits[r]) printf("  #%d=%llu",r+1,ts[i].rule_hits[r]);
+        putchar('\n');
+    }
+    puts("\n正在恢复原硬件断点状态并分离线程……"); cleanup(ts,n);
+    printf("\n========== RegHook v6.4.1 统计 ==========\n识别到的硬件断点事件：%llu\n寄存器写回成功：%llu\n寄存器写回失败：%llu\n单步失败：%llu\n断点启用/恢复相关失败：%llu\n继续执行失败：%llu\n原断点状态恢复失败：%llu\n线程分离失败：%llu\n异常停止事件：%llu\n线程附加/停止失败：%llu\n线程断点安装失败：%llu\n寄存器上下文读取失败：%llu\n清理时无法确认线程停止：%llu\n启动时发现线程数：%llu\n成功附加/记录线程数：%llu\n成功恢复运行线程数：%llu\n",
+        g_hw_hits,g_hits,g_write_failures,g_step_failures,g_reenable_failures,g_continue_failures,g_restore_failures,g_detach_failures,g_unexpected_stops,g_attach_failures,g_setup_failures,g_reg_read_failures,g_cleanup_stop_failures,g_threads_found,g_threads_attached,g_threads_resumed);
+    for(int i=0;i<rule_count;i++) printf("规则 #%d：命中=%llu，写回失败=%llu，地址=0x%llx，寄存器=%c%d，值=0x%llx\n",i+1,rules[i].hits,rules[i].writes_failed,(unsigned long long)rules[i].addr,rules[i].width32?'W':'X',rules[i].reg_index,(unsigned long long)rules[i].value);
+    return 0;
+}
